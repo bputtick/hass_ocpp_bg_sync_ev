@@ -1047,6 +1047,38 @@ class ChargePoint(cp):
         tx_key = (connector_id, csess.transaction_id.value)
         session_key = (connector_id, csess.session_time.value)
 
+        # Connector metrics are initialised with 0, not None. After an HA
+        # restart that means the old "is None" recovery path never restored
+        # Meter.Start for a transaction that remained active on the charger.
+        # Restore the persisted baseline only when HA's persisted transaction
+        # id matches the transaction id in this MeterValues call, so a stale
+        # baseline from an earlier transaction cannot be adopted.
+        current_meter_start = self._metrics[ms_key].value
+        if tx_has_id and current_meter_start in (None, 0):
+            ha_tx = self.get_ha_metric(csess.transaction_id.value, connector_id)
+            try:
+                ha_tx = int(ha_tx)
+            except (TypeError, ValueError):
+                ha_tx = 0
+
+            if ha_tx == transaction_id:
+                value = self.get_ha_metric(csess.meter_start.value, connector_id)
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    value = None
+
+                if value not in (None, 0):
+                    self._metrics[ms_key].value = value
+                    _LOGGER.debug(
+                        "%s[%s] restored value=%s from HA for transactionId=%s.",
+                        csess.meter_start.value,
+                        connector_id,
+                        value,
+                        transaction_id,
+                    )
+
+        # Legacy/non-transaction fallback.
         if self._metrics[ms_key].value is None:
             value = self.get_ha_metric(csess.meter_start.value, connector_id)
             if value is None:
