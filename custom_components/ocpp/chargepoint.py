@@ -957,9 +957,23 @@ class ChargePoint(cp):
                     value = value / 1000
                     unit = HA_POWER_UNIT
 
-                if self._metrics[(connector_id, csess.meter_start.value)].value == 0:
-                    # Charger reports Energy.Active.Import.Register directly as Session energy for transactions.
+                # Only classify EAIR as a charger-provided session counter
+                # while processing an active transaction and when there is no
+                # usable cumulative meter baseline. After an HA restart the
+                # metric can briefly be zero before Meter.Start is restored;
+                # treating that transient zero as permanent misclassifies
+                # cumulative meters and makes Session Energy reset.
+                meter_start_value = self._metrics[
+                    (connector_id, csess.meter_start.value)
+                ].value
+                if is_transaction and meter_start_value == 0:
                     self._charger_reports_session_energy = True
+                elif is_transaction and meter_start_value not in (None, 0):
+                    # A valid non-zero transaction baseline proves that EAIR
+                    # can be derived cumulatively for this transaction. This
+                    # also self-heals a false classification made during
+                    # reconnect before Meter.Start was restored.
+                    self._charger_reports_session_energy = False
 
                 if phase is None:
                     is_eair = measurand == DEFAULT_MEASURAND
