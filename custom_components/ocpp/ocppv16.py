@@ -9,6 +9,7 @@ import time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import UnitOfTime
+from homeassistant.helpers.storage import Store
 import voluptuous as vol
 from websockets.asyncio.server import ServerConnection
 
@@ -110,6 +111,13 @@ class ChargePoint(cp):
         # Keep session timing separate from the OCPP transaction id. Transaction
         # ids are opaque by specification and must not be treated as timestamps.
         self._tx_started_at: dict[int, float] = {}  # connector_id -> unix epoch
+        # Persist active transaction metadata independently of entity state.
+        # Entity states are not available early enough during integration startup
+        # to recover a transaction that remained active across an HA restart.
+        self._session_store = Store(
+            hass, 1, f"{__package__}.{entry.entry_id}.active_sessions"
+        )
+        self._persisted_sessions: dict[str, dict] | None = None
         # BG Sync fork: both of these keys are reported readonly:true, so they
         # cannot change while the connection is up. Upstream re-reads them on
         # every set_charge_rate; with a solar controller setting a limit every
@@ -120,6 +128,35 @@ class ChargePoint(cp):
         # Last limit the charger accepted, keyed by (profile purpose, connector).
         # Used to skip SetChargingProfile calls that would be exact no-ops.
         self._applied_limits: dict[tuple[str, int], float] = {}
+
+    async def _async_load_persisted_sessions(self) -> dict[str, dict]:
+        """Load persisted active-session state once per integration instance."""
+        if self._persisted_sessions is None:
+            data = await self._session_store.async_load()
+            self._persisted_sessions = data if isinstance(data, dict) else {}
+        return self._persisted_sessions
+
+    async def _async_persist_session(
+        self,
+        connector_id: int,
+        transaction_id: int,
+        meter_start_kwh: float,
+        started_at: float,
+    ) -> None:
+        """Persist the minimum state needed to survive an HA restart."""
+        sessions = await self._async_load_persisted_sessions()
+        sessions[str(connector_id)] = {
+            "transaction_id": int(transaction_id),
+            "meter_start_kwh": float(meter_start_kwh),
+            "started_at": float(started_at),
+        }
+        await self._session_store.async_save(sessions)
+
+    async def _async_clear_persisted_session(self, connector_id: int) -> None:
+        """Remove persisted state when a transaction ends."""
+        sessions = await self._async_load_persisted_sessions()
+        sessions.pop(str(connector_id), None)
+        await self._session_store.async_save(sessions)
 
     def _invalidate_charging_profile_cache(self) -> None:
         """Drop cached profile state, forcing a full refresh on the next set.
@@ -1036,7 +1073,7 @@ class ChargePoint(cp):
         )
 
     @on(Action.meter_values)
-    def on_meter_values(self, connector_id: int, meter_value: dict, **kwargs):
+    async def on_meter_values(self, connector_id: int, meter_value: dict, **kwargs):
         """Request handler for MeterValues Calls (multi-connector aware)."""
 
         transaction_id: int = int(kwargs.get(om.transaction_id.name, 0) or 0)
@@ -1046,6 +1083,44 @@ class ChargePoint(cp):
         ms_key = (connector_id, csess.meter_start.value)
         tx_key = (connector_id, csess.transaction_id.value)
         session_key = (connector_id, csess.session_time.value)
+
+        # Prefer transaction metadata persisted by the integration itself.
+        # HA entity state is not guaranteed to exist when the first MeterValues
+        # arrives after a restart.
+        persisted_sessions = await self._async_load_persisted_sessions()
+        persisted = persisted_sessions.get(str(connector_id))
+        if tx_has_id and isinstance(persisted, dict):
+            try:
+                persisted_tx = int(persisted.get("transaction_id", 0) or 0)
+                persisted_meter_start = float(persisted["meter_start_kwh"])
+                persisted_started_at = float(persisted["started_at"])
+            except (KeyError, TypeError, ValueError):
+                persisted_tx = 0
+                persisted_meter_start = 0.0
+                persisted_started_at = 0.0
+
+            if persisted_tx == transaction_id:
+                self._active_tx[connector_id] = transaction_id
+                self._metrics[tx_key].value = transaction_id
+                self._metrics[ms_key].value = persisted_meter_start
+                self._metrics[ms_key].unit = HA_ENERGY_UNIT
+                self._tx_started_at[connector_id] = persisted_started_at
+                _LOGGER.warning(
+                    "Restored active session conn=%s transactionId=%s "
+                    "meter_start=%s started_at=%s from persistent storage",
+                    connector_id,
+                    transaction_id,
+                    persisted_meter_start,
+                    persisted_started_at,
+                )
+            elif persisted_tx:
+                _LOGGER.warning(
+                    "Ignoring stale persisted session conn=%s transactionId=%s; "
+                    "charger reports transactionId=%s",
+                    connector_id,
+                    persisted_tx,
+                    transaction_id,
+                )
 
         # Connector metrics are initialised with 0, not None. After an HA
         # restart that means the old "is None" recovery path never restored
@@ -1367,14 +1442,15 @@ class ChargePoint(cp):
         return call_result.Authorize(id_tag_info={om.status.value: auth_status})
 
     @on(Action.start_transaction)
-    def on_start_transaction(self, connector_id, id_tag, meter_start, **kwargs):
+    async def on_start_transaction(self, connector_id, id_tag, meter_start, **kwargs):
         """Handle a Start Transaction request."""
 
         auth_status = self.get_authorization_status(id_tag)
         if auth_status == AuthorizationStatus.accepted.value:
             tx_id = int(time.time())
             self._active_tx[connector_id] = tx_id
-            self._tx_started_at[connector_id] = time.time()
+            started_at = time.time()
+            self._tx_started_at[connector_id] = started_at
             # Any cached TxProfile limit was bound to the previous transaction
             # id and must not be treated as still applied.
             self._invalidate_charging_profile_cache()
@@ -1400,6 +1476,10 @@ class ChargePoint(cp):
                 (connector_id, csess.session_energy.value)
             ].unit = HA_ENERGY_UNIT
 
+            await self._async_persist_session(
+                connector_id, tx_id, meter_start_kwh, started_at
+            )
+
             result = call_result.StartTransaction(
                 id_tag_info={om.status.value: AuthorizationStatus.accepted.value},
                 transaction_id=tx_id,
@@ -1414,7 +1494,7 @@ class ChargePoint(cp):
         return result
 
     @on(Action.stop_transaction)
-    def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
+    async def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
         """Stop the current transaction (multi-connector)."""
 
         # The charger discards the transaction-bound TxProfile when the
@@ -1438,6 +1518,7 @@ class ChargePoint(cp):
         # Reset active transaction (global + per-connector)
         self._active_tx[conn] = 0
         self._tx_started_at.pop(conn, None)
+        await self._async_clear_persisted_session(conn)
         self.active_transaction_id = 0
         self._metrics[(conn, cstat.id_tag.value)].value = ""
         self._metrics[(conn, csess.transaction_id.value)].value = 0
