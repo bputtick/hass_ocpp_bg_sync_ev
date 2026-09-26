@@ -17,5 +17,5 @@
     "ocpp>=2.1.0",
     "websockets>=14.1"
   ],
-  "version": "1.0.2-bputtick.5"
+  "version": "1.0.2-bputtick.6"
 }
