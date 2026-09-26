@@ -1153,6 +1153,32 @@ class ChargePoint(cp):
 
         self.process_measurands(meter_values, transaction_matches, connector_id)
 
+        # Home Assistant can restart while the charger keeps the OCPP
+        # transaction alive. In that case Session Energy may be restored/reset
+        # independently of Meter.Start. For chargers that expose a cumulative
+        # Energy.Active.Import.Register, always rebuild Session Energy from the
+        # original transaction meter start after processing the latest sample.
+        # This makes the value restart-safe in the same way as Session Time.
+        if (
+            tx_has_id
+            and transaction_matches
+            and not self._charger_reports_session_energy
+        ):
+            try:
+                meter_start_kwh = float(self._metrics[ms_key].value)
+                cumulative = self._metrics.get((connector_id, DEFAULT_MEASURAND))
+                cumulative_kwh = float(cumulative.value)
+                if cumulative_kwh >= meter_start_kwh:
+                    session_energy = self._metrics[
+                        (connector_id, csess.session_energy.value)
+                    ]
+                    session_energy.value = round(
+                        cumulative_kwh - meter_start_kwh, 3
+                    )
+                    session_energy.unit = HA_ENERGY_UNIT
+            except (AttributeError, TypeError, ValueError):
+                pass
+
         if tx_has_id and transaction_matches:
             tx_start_epoch = self._tx_started_at.get(connector_id)
             if tx_start_epoch is None:
