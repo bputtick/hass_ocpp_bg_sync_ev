@@ -1056,6 +1056,18 @@ class ChargePoint(cp):
         current_meter_start = self._metrics[ms_key].value
         if tx_has_id and current_meter_start in (None, 0):
             ha_tx = self.get_ha_metric(csess.transaction_id.value, connector_id)
+            ha_meter_start = self.get_ha_metric(
+                csess.meter_start.value, connector_id
+            )
+            _LOGGER.warning(
+                "Session recovery diagnostic conn=%s incoming_tx=%s "
+                "internal_meter_start=%r ha_tx=%r ha_meter_start=%r",
+                connector_id,
+                transaction_id,
+                current_meter_start,
+                ha_tx,
+                ha_meter_start,
+            )
             try:
                 ha_tx = int(ha_tx)
             except (TypeError, ValueError):
