@@ -1087,40 +1087,45 @@ class ChargePoint(cp):
         # Prefer transaction metadata persisted by the integration itself.
         # HA entity state is not guaranteed to exist when the first MeterValues
         # arrives after a restart.
-        persisted_sessions = await self._async_load_persisted_sessions()
-        persisted = persisted_sessions.get(str(connector_id))
-        if tx_has_id and isinstance(persisted, dict):
-            try:
-                persisted_tx = int(persisted.get("transaction_id", 0) or 0)
-                persisted_meter_start = float(persisted["meter_start_kwh"])
-                persisted_started_at = float(persisted["started_at"])
-            except (KeyError, TypeError, ValueError):
-                persisted_tx = 0
-                persisted_meter_start = 0.0
-                persisted_started_at = 0.0
+        # Once a transaction has been restored into memory, subsequent
+        # MeterValues use that state directly. Do not re-apply/log the persisted
+        # snapshot on every sample.
+        in_memory_tx = int(self._active_tx.get(connector_id, 0) or 0)
+        if tx_has_id and in_memory_tx == 0:
+            persisted_sessions = await self._async_load_persisted_sessions()
+            persisted = persisted_sessions.get(str(connector_id))
+            if isinstance(persisted, dict):
+                try:
+                    persisted_tx = int(persisted.get("transaction_id", 0) or 0)
+                    persisted_meter_start = float(persisted["meter_start_kwh"])
+                    persisted_started_at = float(persisted["started_at"])
+                except (KeyError, TypeError, ValueError):
+                    persisted_tx = 0
+                    persisted_meter_start = 0.0
+                    persisted_started_at = 0.0
 
-            if persisted_tx == transaction_id:
-                self._active_tx[connector_id] = transaction_id
-                self._metrics[tx_key].value = transaction_id
-                self._metrics[ms_key].value = persisted_meter_start
-                self._metrics[ms_key].unit = HA_ENERGY_UNIT
-                self._tx_started_at[connector_id] = persisted_started_at
-                _LOGGER.warning(
-                    "Restored active session conn=%s transactionId=%s "
-                    "meter_start=%s started_at=%s from persistent storage",
-                    connector_id,
-                    transaction_id,
-                    persisted_meter_start,
-                    persisted_started_at,
-                )
-            elif persisted_tx:
-                _LOGGER.warning(
-                    "Ignoring stale persisted session conn=%s transactionId=%s; "
-                    "charger reports transactionId=%s",
-                    connector_id,
-                    persisted_tx,
-                    transaction_id,
-                )
+                if persisted_tx == transaction_id:
+                    self._active_tx[connector_id] = transaction_id
+                    self._metrics[tx_key].value = transaction_id
+                    self._metrics[ms_key].value = persisted_meter_start
+                    self._metrics[ms_key].unit = HA_ENERGY_UNIT
+                    self._tx_started_at[connector_id] = persisted_started_at
+                    _LOGGER.info(
+                        "Restored active session conn=%s transactionId=%s "
+                        "meter_start=%s started_at=%s from persistent storage",
+                        connector_id,
+                        transaction_id,
+                        persisted_meter_start,
+                        persisted_started_at,
+                    )
+                elif persisted_tx:
+                    _LOGGER.warning(
+                        "Ignoring stale persisted session conn=%s transactionId=%s; "
+                        "charger reports transactionId=%s",
+                        connector_id,
+                        persisted_tx,
+                        transaction_id,
+                    )
 
         # Connector metrics are initialised with 0, not None. After an HA
         # restart that means the old "is None" recovery path never restored
